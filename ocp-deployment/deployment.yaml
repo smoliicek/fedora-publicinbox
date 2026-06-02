@@ -1,0 +1,166 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: public-inbox
+  namespace: communishift-public-inbox-poc
+  labels:
+    app: public-inbox
+spec:
+  # MUST stay at 1: EBS RWO + Xapian writer, never scale up.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: public-inbox
+  template:
+    metadata:
+      labels:
+        app: public-inbox
+    spec:
+      securityContext:
+        fsGroup: 1001090000
+        fsGroupChangePolicy: OnRootMismatch
+
+      initContainers:
+        - name: init-public-inbox
+          image: docker.io/smoliicek/ocp-public-inbox:poc
+          imagePullPolicy: Always
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              PUBLIC_INBOX_URL="https://public-inbox-communishift-public-inbox-poc.apps.fedora.cj14.p1.openshiftapps.com/git-commits"
+
+              if [ ! -f /var/lib/public-inbox/config ]; then
+                public-inbox-init \
+                  -V2 \
+                  -L basic \
+                  git-commits \
+                  /var/lib/public-inbox \
+                  "${PUBLIC_INBOX_URL}" \
+                  git-commits@fedoraproject.org
+                git config -f "${PI_CONFIG}" publicinboxmda.spamcheck none
+              fi
+
+              # Always ensure publicinbox is configured to show listing, manifests, and correct inbox URL
+              git config -f "${PI_CONFIG}" publicinbox.wwwlisting all
+              git config -f "${PI_CONFIG}" publicinbox.grokmanifest all
+              git config -f "${PI_CONFIG}" publicinbox.git-commits.url "${PUBLIC_INBOX_URL}"
+
+              public-inbox-index /var/lib/public-inbox
+          env:
+            - name: HOME
+              value: /var/lib/public-inbox
+            - name: PI_CONFIG
+              value: /var/lib/public-inbox/config
+          volumeMounts:
+            - name: public-inbox-data
+              mountPath: /var/lib/public-inbox
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+
+      containers:
+        # --- fedora-messaging consumer ---
+        - name: consumer
+          image: docker.io/smoliicek/ocp-public-inbox:poc
+          imagePullPolicy: Always
+          command:
+            - fedora-messaging
+            - consume
+          env:
+            - name: HOME
+              value: /var/lib/public-inbox
+            - name: FEDORA_MESSAGING_CONF
+              value: /etc/fedora-messaging/config.toml
+            - name: PI_CONFIG
+              value: /var/lib/public-inbox/config
+          volumeMounts:
+            - name: public-inbox-data
+              mountPath: /var/lib/public-inbox
+            - name: fedora-messaging-config
+              mountPath: /etc/fedora-messaging/config.toml
+              subPath: config.toml
+              readOnly: true
+          ports:
+            - name: monitoring
+              containerPort: 8081
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+
+        # --- public-inbox-httpd ---
+        - name: httpd
+          image: docker.io/smoliicek/ocp-public-inbox:poc
+          imagePullPolicy: Always
+          command:
+            - public-inbox-httpd
+            - --listen
+            - 0.0.0.0:8080
+          env:
+            - name: HOME
+              value: /var/lib/public-inbox
+            - name: PI_CONFIG
+              value: /var/lib/public-inbox/config
+          volumeMounts:
+            - name: public-inbox-data
+              mountPath: /var/lib/public-inbox
+              # httpd only reads; consumer handles all writes.
+              readOnly: true
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /manifest.js.gz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /manifest.js.gz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        - name: public-inbox-data
+          persistentVolumeClaim:
+            claimName: public-inbox-data
+        - name: fedora-messaging-config
+          configMap:
+            name: fedora-messaging-config
